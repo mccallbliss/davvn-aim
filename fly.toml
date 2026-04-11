@@ -1,0 +1,22 @@
+app = "davvn-aim"
+primary_region = "iad"
+
+[build]
+
+[env]
+  PORT = "3001"
+  CORS_ORIGIN = "https://yourdomain.com"
+
+[http_service]
+  internal_port = 3001
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[mounts]
+  source = "aim_data"
+  destination = "/app/data"
