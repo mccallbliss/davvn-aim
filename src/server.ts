@@ -1,18 +1,65 @@
 import 'dotenv/config'
-import express from 'express'
+import express, { type Request, type Response, type NextFunction } from 'express'
 import { createServer } from 'http'
 import { Server } from 'socket.io'
 import cors from 'cors'
+import { rateLimit } from 'express-rate-limit'
 import type { User, BuddyInfo, ClientEvents, ServerEvents } from './types.js'
-import { saveMessage, loadHistory, saveReport, getReportsForUser, touchScreenName, addGuestbookEntry, getGuestbook, addSmsSignup } from './db.js'
+import {
+  saveMessage,
+  loadHistory,
+  saveReport,
+  getReportsForUser,
+  touchScreenName,
+  addGuestbookEntry,
+  getGuestbook,
+  getGuestbookAll,
+  deleteGuestbookEntry,
+  addSmsSignup,
+  getAllSmsSignups,
+} from './db.js'
 import { filterMessage, checkRateLimit, isUserMuted, checkAutoMute, validateScreenName } from './moderation.js'
 
 const PORT = parseInt(process.env.PORT || '3001')
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173'
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || ''
 
 const app = express()
+
+// Trust the proxy in front of us (Fly's edge) so express-rate-limit
+// gets the real client IP rather than the load balancer's.
+app.set('trust proxy', 1)
+
 app.use(cors({ origin: CORS_ORIGIN }))
 app.use(express.json())
+
+// ---- Rate limiters ----
+// Light limits on the public POSTs so launch day doesn't get spammed.
+// (Socket.IO chat has its own per-screen-name limiter in moderation.ts.)
+const guestbookLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000, // 10 minutes
+  limit: 5,                 // 5 posts per IP per window
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'You\'re posting too fast — try again in a few minutes.' },
+})
+const smsSignupLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  limit: 3,                 // 3 attempts per IP per hour
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many sign-up attempts — try again later.' },
+})
+
+// ---- Admin auth ----
+// Tiny shared-secret middleware. If ADMIN_TOKEN is unset, all admin routes
+// return 503 — better to be unreachable than accidentally wide-open.
+function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  if (!ADMIN_TOKEN) return res.status(503).json({ error: 'Admin disabled (ADMIN_TOKEN not set)' })
+  const provided = req.header('x-admin-token') || ''
+  if (provided !== ADMIN_TOKEN) return res.status(401).json({ error: 'Unauthorized' })
+  next()
+}
 
 // Health check
 app.get('/', (_req, res) => {
@@ -37,7 +84,7 @@ app.get('/guestbook', (_req, res) => {
   }
 })
 
-app.post('/guestbook', (req, res) => {
+app.post('/guestbook', guestbookLimiter, (req, res) => {
   const { name, location, message } = req.body
   if (!name || !message) return res.status(400).json({ error: 'Name and message are required' })
   if (typeof name !== 'string' || typeof message !== 'string') return res.status(400).json({ error: 'Invalid input' })
@@ -59,7 +106,7 @@ app.post('/guestbook', (req, res) => {
 })
 
 // ---- SMS Signup API ----
-app.post('/sms-signup', (req, res) => {
+app.post('/sms-signup', smsSignupLimiter, (req, res) => {
   const { phone } = req.body
   if (!phone || typeof phone !== 'string') return res.status(400).json({ error: 'Phone number is required' })
 
@@ -73,6 +120,44 @@ app.post('/sms-signup', (req, res) => {
     // UNIQUE constraint means they already signed up
     res.json({ success: true, message: 'Already signed up!' })
   }
+})
+
+// ---- Admin API ----
+// All routes gated by requireAdmin (X-Admin-Token: <ADMIN_TOKEN>).
+// Set ADMIN_TOKEN via `fly secrets set ADMIN_TOKEN=...` before relying on it.
+app.get('/admin/guestbook', requireAdmin, (req, res) => {
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '500')) || 500, 1), 5000)
+  try {
+    res.json(getGuestbookAll(limit))
+  } catch {
+    res.status(500).json({ error: 'Failed to load guestbook' })
+  }
+})
+
+app.delete('/admin/guestbook/:id', requireAdmin, (req, res) => {
+  try {
+    const removed = deleteGuestbookEntry(req.params.id)
+    if (!removed) return res.status(404).json({ error: 'Not found' })
+    res.json({ ok: true, id: req.params.id })
+  } catch {
+    res.status(500).json({ error: 'Failed to delete entry' })
+  }
+})
+
+app.get('/admin/sms-signups', requireAdmin, (_req, res) => {
+  try {
+    res.json(getAllSmsSignups())
+  } catch {
+    res.status(500).json({ error: 'Failed to load signups' })
+  }
+})
+
+// ---- Express error handler (last) ----
+// Catches errors from sync handlers and rejected promises that bubble up.
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  console.error('[express-error]', err)
+  if (res.headersSent) return
+  res.status(500).json({ error: 'Internal server error' })
 })
 
 const httpServer = createServer(app)
@@ -275,6 +360,20 @@ httpServer.listen(PORT, () => {
   console.log(`  🏃 davvn AIM server`)
   console.log(`  ├─ http://localhost:${PORT}`)
   console.log(`  ├─ CORS: ${CORS_ORIGIN}`)
+  console.log(`  ├─ admin: ${ADMIN_TOKEN ? 'enabled' : 'disabled (ADMIN_TOKEN not set)'}`)
   console.log(`  └─ waiting for connections...`)
   console.log(``)
+})
+
+// ---- Process-level safety nets ----
+// Don't let a stray throw from a socket handler take the whole server
+// down. Log loudly so we notice in `fly logs`.
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err)
+})
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason)
+})
+io.engine.on('connection_error', (err) => {
+  console.error('[socket.io connection_error]', err.code, err.message)
 })

@@ -147,6 +147,14 @@ const getGuestbookEntries = db.prepare(`
   SELECT * FROM guestbook ORDER BY timestamp DESC LIMIT 50
 `)
 
+const getAllGuestbookEntries = db.prepare(`
+  SELECT * FROM guestbook ORDER BY timestamp DESC LIMIT ?
+`)
+
+const deleteGuestbookStmt = db.prepare(`
+  DELETE FROM guestbook WHERE id = ?
+`)
+
 export function addGuestbookEntry(name: string, location: string, message: string): GuestbookEntry {
   const entry: GuestbookEntry = { id: uuid(), name, location, message, timestamp: Date.now() }
   insertGuestbookEntry.run(entry.id, entry.name, entry.location, entry.message, entry.timestamp)
@@ -155,6 +163,15 @@ export function addGuestbookEntry(name: string, location: string, message: strin
 
 export function getGuestbook(): GuestbookEntry[] {
   return getGuestbookEntries.all() as GuestbookEntry[]
+}
+
+export function getGuestbookAll(limit = 500): GuestbookEntry[] {
+  return getAllGuestbookEntries.all(limit) as GuestbookEntry[]
+}
+
+export function deleteGuestbookEntry(id: string): boolean {
+  const info = deleteGuestbookStmt.run(id)
+  return info.changes > 0
 }
 
 // ---- SMS Signups ----
