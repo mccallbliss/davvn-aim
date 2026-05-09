@@ -4,7 +4,7 @@ import { createServer } from 'http'
 import { Server } from 'socket.io'
 import cors from 'cors'
 import type { User, BuddyInfo, ClientEvents, ServerEvents } from './types.js'
-import { saveMessage, loadHistory, saveReport, getReportsForUser, touchScreenName } from './db.js'
+import { saveMessage, loadHistory, saveReport, getReportsForUser, touchScreenName, addGuestbookEntry, getGuestbook, addSmsSignup } from './db.js'
 import { filterMessage, checkRateLimit, isUserMuted, checkAutoMute, validateScreenName } from './moderation.js'
 
 const PORT = parseInt(process.env.PORT || '3001')
@@ -12,6 +12,7 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173'
 
 const app = express()
 app.use(cors({ origin: CORS_ORIGIN }))
+app.use(express.json())
 
 // Health check
 app.get('/', (_req, res) => {
@@ -24,6 +25,54 @@ app.get('/', (_req, res) => {
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true })
+})
+
+// ---- Guestbook REST API ----
+app.get('/guestbook', (_req, res) => {
+  try {
+    const entries = getGuestbook()
+    res.json(entries)
+  } catch {
+    res.status(500).json({ error: 'Failed to load guestbook' })
+  }
+})
+
+app.post('/guestbook', (req, res) => {
+  const { name, location, message } = req.body
+  if (!name || !message) return res.status(400).json({ error: 'Name and message are required' })
+  if (typeof name !== 'string' || typeof message !== 'string') return res.status(400).json({ error: 'Invalid input' })
+  if (name.trim().length < 1 || name.trim().length > 30) return res.status(400).json({ error: 'Name must be 1-30 characters' })
+  if (message.trim().length < 1 || message.trim().length > 500) return res.status(400).json({ error: 'Message must be 1-500 characters' })
+
+  const filtered = filterMessage(message)
+  if (!filtered.allowed) return res.status(400).json({ error: filtered.reason })
+
+  const nameFiltered = filterMessage(name)
+  if (!nameFiltered.allowed) return res.status(400).json({ error: 'Name contains inappropriate content' })
+
+  try {
+    const entry = addGuestbookEntry(name.trim(), (location || '').trim().slice(0, 50), message.trim())
+    res.json(entry)
+  } catch {
+    res.status(500).json({ error: 'Failed to save entry' })
+  }
+})
+
+// ---- SMS Signup API ----
+app.post('/sms-signup', (req, res) => {
+  const { phone } = req.body
+  if (!phone || typeof phone !== 'string') return res.status(400).json({ error: 'Phone number is required' })
+
+  const clean = phone.replace(/\D/g, '')
+  if (clean.length !== 10) return res.status(400).json({ error: 'Enter a valid 10-digit phone number' })
+
+  try {
+    const entry = addSmsSignup(clean)
+    res.json({ success: true, ...entry })
+  } catch {
+    // UNIQUE constraint means they already signed up
+    res.json({ success: true, message: 'Already signed up!' })
+  }
 })
 
 const httpServer = createServer(app)

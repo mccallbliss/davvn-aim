@@ -1,8 +1,22 @@
 import Database from 'better-sqlite3'
 import { v4 as uuid } from 'uuid'
+import { mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
 import type { Message, Report } from './types.js'
 
-const db = new Database('aim.db')
+// DB path is env-driven so the Fly volume mount at /app/data is actually used.
+// Falls back to a local file in dev.
+const DB_PATH = process.env.DB_PATH || 'aim.db'
+
+// Make sure the parent directory exists (e.g. /app/data on first boot).
+try {
+  mkdirSync(dirname(DB_PATH), { recursive: true })
+} catch {
+  // ignore — happens when path has no directory component (e.g. "aim.db")
+}
+
+const db = new Database(DB_PATH)
+console.log(`[db] opened ${DB_PATH}`)
 
 // Enable WAL mode for better concurrent performance
 db.pragma('journal_mode = WAL')
@@ -35,6 +49,16 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_messages_users ON messages(from_user, to_user);
   CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
   CREATE INDEX IF NOT EXISTS idx_reports_user ON reports(reported_user);
+
+  CREATE TABLE IF NOT EXISTS guestbook (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    location TEXT DEFAULT '',
+    message TEXT NOT NULL,
+    timestamp INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_guestbook_timestamp ON guestbook(timestamp);
 `)
 
 // Prepared statements
@@ -103,4 +127,60 @@ export function getReportsForUser(screenName: string): number {
 export function touchScreenName(screenName: string): void {
   const now = Date.now()
   upsertScreenName.run(screenName, now, now, now)
+}
+
+// ---- Guestbook ----
+
+export interface GuestbookEntry {
+  id: string
+  name: string
+  location: string
+  message: string
+  timestamp: number
+}
+
+const insertGuestbookEntry = db.prepare(`
+  INSERT INTO guestbook (id, name, location, message, timestamp) VALUES (?, ?, ?, ?, ?)
+`)
+
+const getGuestbookEntries = db.prepare(`
+  SELECT * FROM guestbook ORDER BY timestamp DESC LIMIT 50
+`)
+
+export function addGuestbookEntry(name: string, location: string, message: string): GuestbookEntry {
+  const entry: GuestbookEntry = { id: uuid(), name, location, message, timestamp: Date.now() }
+  insertGuestbookEntry.run(entry.id, entry.name, entry.location, entry.message, entry.timestamp)
+  return entry
+}
+
+export function getGuestbook(): GuestbookEntry[] {
+  return getGuestbookEntries.all() as GuestbookEntry[]
+}
+
+// ---- SMS Signups ----
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sms_signups (
+    id TEXT PRIMARY KEY,
+    phone TEXT NOT NULL UNIQUE,
+    timestamp INTEGER NOT NULL
+  );
+`)
+
+const insertSmsSignup = db.prepare(`
+  INSERT OR IGNORE INTO sms_signups (id, phone, timestamp) VALUES (?, ?, ?)
+`)
+
+const getSmsSignups = db.prepare(`
+  SELECT * FROM sms_signups ORDER BY timestamp DESC
+`)
+
+export function addSmsSignup(phone: string): { id: string; phone: string; timestamp: number } {
+  const entry = { id: uuid(), phone, timestamp: Date.now() }
+  insertSmsSignup.run(entry.id, entry.phone, entry.timestamp)
+  return entry
+}
+
+export function getAllSmsSignups() {
+  return getSmsSignups.all()
 }

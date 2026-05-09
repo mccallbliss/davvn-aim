@@ -5,7 +5,11 @@ primary_region = "iad"
 
 [env]
   PORT = "3001"
+  # Set to the production frontend origin (e.g. "https://davvn.com") via
+  # `fly secrets set CORS_ORIGIN=...` or by editing this value before deploy.
   CORS_ORIGIN = "https://yourdomain.com"
+  # DB lives on the mounted volume so it survives redeploys.
+  DB_PATH = "/app/data/aim.db"
 
 [http_service]
   internal_port = 3001
